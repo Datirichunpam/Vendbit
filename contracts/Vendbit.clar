@@ -15,6 +15,11 @@
 (define-constant ERR_INVALID_INTERVAL (err u113))
 (define-constant ERR_INVALID_DURATION (err u114))
 (define-constant ERR_AUTO_RENEWAL_FAILED (err u115))
+(define-constant ERR_REVIEW_NOT_FOUND (err u116))
+(define-constant ERR_REVIEW_ALREADY_EXISTS (err u117))
+(define-constant ERR_INVALID_RATING (err u118))
+(define-constant ERR_PAYMENT_NOT_SETTLED (err u119))
+(define-constant ERR_CANNOT_REVIEW_OWN_VENDOR (err u120))
 (define-constant PLATFORM_FEE u25)
 (define-constant MIN_PAYMENT u1000000)
 (define-constant MAX_PAYMENT u1000000000000)
@@ -29,6 +34,7 @@
 (define-data-var platform-treasury uint u0)
 (define-data-var total-subscriptions uint u0)
 (define-data-var total-subscription-revenue uint u0)
+(define-data-var total-reviews uint u0)
 
 (define-map vendors
   { vendor-id: principal }
@@ -41,7 +47,9 @@
     total-sales: uint,
     payment-count: uint,
     rating: uint,
-    is-verified: bool
+    is-verified: bool,
+    total-rating-points: uint,
+    review-count: uint
   }
 )
 
@@ -130,6 +138,32 @@
   { next-subscription-id: uint }
 )
 
+(define-map vendor-reviews
+  { vendor: principal, reviewer: principal }
+  {
+    review-id: uint,
+    payment-id: uint,
+    rating: uint,
+    review-text: (string-ascii 500),
+    created-at: uint,
+    is-verified: bool
+  }
+)
+
+(define-map review-responses
+  { review-id: uint }
+  {
+    vendor: principal,
+    response-text: (string-ascii 300),
+    responded-at: uint
+  }
+)
+
+(define-map customer-review-eligibility
+  { customer: principal, vendor: principal }
+  { can-review: bool, last-settled-payment: uint }
+)
+
 (define-public (register-vendor (name (string-ascii 50)) (description (string-ascii 200)) (qr-code (string-ascii 100)))
   (let (
     (vendor-id tx-sender)
@@ -151,7 +185,9 @@
         total-sales: u0,
         payment-count: u0,
         rating: u5000,
-        is-verified: false
+        is-verified: false,
+        total-rating-points: u0,
+        review-count: u0
       }
     )
     
@@ -199,6 +235,11 @@
     (map-set customer-payments
       { customer: tx-sender, payment-id: payment-id }
       { exists: true }
+    )
+    
+    (map-set customer-review-eligibility
+      { customer: tx-sender, vendor: vendor }
+      { can-review: false, last-settled-payment: u0 }
     )
     
     (let (
@@ -259,6 +300,11 @@
         status: "settled",
         settlement-block: (some current-block)
       })
+    )
+    
+    (map-set customer-review-eligibility
+      { customer: (get customer payment-info), vendor: vendor }
+      { can-review: true, last-settled-payment: payment-id }
     )
     
     (ok true)
@@ -706,3 +752,179 @@
     total-subscription-revenue: (var-get total-subscription-revenue)
   }
 )
+
+(define-public (submit-review (vendor principal) (payment-id uint) (rating uint) (review-text (string-ascii 500)))
+  (let (
+    (reviewer tx-sender)
+    (payment-info (unwrap! (map-get? payments { payment-id: payment-id }) ERR_PAYMENT_NOT_FOUND))
+    (vendor-info (unwrap! (map-get? vendors { vendor-id: vendor }) ERR_VENDOR_NOT_FOUND))
+    (eligibility (default-to { can-review: false, last-settled-payment: u0 } (map-get? customer-review-eligibility { customer: reviewer, vendor: vendor })))
+    (current-block stacks-block-height)
+    (review-id (+ (var-get total-reviews) u1))
+  )
+    (asserts! (not (is-eq reviewer vendor)) ERR_CANNOT_REVIEW_OWN_VENDOR)
+    (asserts! (>= rating u1) ERR_INVALID_RATING)
+    (asserts! (<= rating u5) ERR_INVALID_RATING)
+    (asserts! (is-eq (get status payment-info) "settled") ERR_PAYMENT_NOT_SETTLED)
+    (asserts! (is-eq (get customer payment-info) reviewer) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get vendor payment-info) vendor) ERR_UNAUTHORIZED)
+    (asserts! (get can-review eligibility) ERR_UNAUTHORIZED)
+    (asserts! (is-none (map-get? vendor-reviews { vendor: vendor, reviewer: reviewer })) ERR_REVIEW_ALREADY_EXISTS)
+    (asserts! (> (len review-text) u0) ERR_INVALID_PAYMENT)
+    
+    (map-set vendor-reviews
+      { vendor: vendor, reviewer: reviewer }
+      {
+        review-id: review-id,
+        payment-id: payment-id,
+        rating: rating,
+        review-text: review-text,
+        created-at: current-block,
+        is-verified: true
+      }
+    )
+    
+    (let (
+      (new-total-rating-points (+ (get total-rating-points vendor-info) rating))
+      (new-review-count (+ (get review-count vendor-info) u1))
+      (new-average-rating (/ (* new-total-rating-points u1000) new-review-count))
+    )
+      (map-set vendors
+        { vendor-id: vendor }
+        (merge vendor-info {
+          total-rating-points: new-total-rating-points,
+          review-count: new-review-count,
+          rating: new-average-rating
+        })
+      )
+    )
+    
+    (map-set customer-review-eligibility
+      { customer: reviewer, vendor: vendor }
+      { can-review: false, last-settled-payment: payment-id }
+    )
+    
+    (var-set total-reviews review-id)
+    
+    (ok review-id)
+  )
+)
+
+(define-public (respond-to-review (review-id uint) (response-text (string-ascii 300)))
+  (let (
+    (vendor tx-sender)
+    (current-block stacks-block-height)
+    (found-review (unwrap! (find-review-by-id review-id vendor) ERR_REVIEW_NOT_FOUND))
+  )
+    (asserts! (> (len response-text) u0) ERR_INVALID_PAYMENT)
+    (asserts! (is-some (map-get? vendors { vendor-id: vendor })) ERR_VENDOR_NOT_FOUND)
+    
+    (map-set review-responses
+      { review-id: review-id }
+      {
+        vendor: vendor,
+        response-text: response-text,
+        responded-at: current-block
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-private (find-review-by-id (target-review-id uint) (target-vendor principal))
+  (let (
+    (review-search-result (map-get? review-responses { review-id: target-review-id }))
+  )
+    (match review-search-result
+      response-data (if (is-eq (get vendor response-data) target-vendor)
+                     (some { review-id: target-review-id, vendor: target-vendor })
+                     none)
+      (some { review-id: target-review-id, vendor: target-vendor })
+    )
+  )
+)
+
+(define-public (update-review-verification (vendor principal) (reviewer principal) (is-verified bool))
+  (let (
+    (review-info (unwrap! (map-get? vendor-reviews { vendor: vendor, reviewer: reviewer }) ERR_REVIEW_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    
+    (map-set vendor-reviews
+      { vendor: vendor, reviewer: reviewer }
+      (merge review-info { is-verified: is-verified })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-review (vendor principal) (reviewer principal))
+  (let (
+    (review-info (unwrap! (map-get? vendor-reviews { vendor: vendor, reviewer: reviewer }) ERR_REVIEW_NOT_FOUND))
+    (vendor-info (unwrap! (map-get? vendors { vendor-id: vendor }) ERR_VENDOR_NOT_FOUND))
+    (review-rating (get rating review-info))
+  )
+    (asserts! (or (is-eq tx-sender reviewer) (is-eq tx-sender CONTRACT_OWNER)) ERR_UNAUTHORIZED)
+    
+    (let (
+      (new-total-rating-points (- (get total-rating-points vendor-info) review-rating))
+      (new-review-count (- (get review-count vendor-info) u1))
+      (new-average-rating (if (is-eq new-review-count u0)
+                           u5000
+                           (/ (* new-total-rating-points u1000) new-review-count)))
+    )
+      (map-set vendors
+        { vendor-id: vendor }
+        (merge vendor-info {
+          total-rating-points: new-total-rating-points,
+          review-count: new-review-count,
+          rating: new-average-rating
+        })
+      )
+    )
+    
+    (map-delete vendor-reviews { vendor: vendor, reviewer: reviewer })
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-vendor-review (vendor principal) (reviewer principal))
+  (map-get? vendor-reviews { vendor: vendor, reviewer: reviewer })
+)
+
+(define-read-only (get-review-response (review-id uint))
+  (map-get? review-responses { review-id: review-id })
+)
+
+(define-read-only (get-customer-review-eligibility (customer principal) (vendor principal))
+  (map-get? customer-review-eligibility { customer: customer, vendor: vendor })
+)
+
+(define-read-only (can-customer-review (customer principal) (vendor principal))
+  (match (map-get? customer-review-eligibility { customer: customer, vendor: vendor })
+    eligibility (get can-review eligibility)
+    false
+  )
+)
+
+(define-read-only (get-vendor-rating-stats (vendor principal))
+  (match (map-get? vendors { vendor-id: vendor })
+    vendor-data (some {
+      rating: (get rating vendor-data),
+      review-count: (get review-count vendor-data),
+      total-rating-points: (get total-rating-points vendor-data)
+    })
+    none
+  )
+)
+
+(define-read-only (get-review-stats)
+  {
+    total-reviews: (var-get total-reviews)
+  }
+)
+
+
