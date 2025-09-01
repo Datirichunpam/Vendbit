@@ -20,12 +20,21 @@
 (define-constant ERR_INVALID_RATING (err u118))
 (define-constant ERR_PAYMENT_NOT_SETTLED (err u119))
 (define-constant ERR_CANNOT_REVIEW_OWN_VENDOR (err u120))
+(define-constant ERR_POINTS_NOT_CONFIGURED (err u121))
+(define-constant ERR_INSUFFICIENT_POINTS (err u122))
+(define-constant ERR_INVALID_POINT_CONFIG (err u123))
 (define-constant PLATFORM_FEE u25)
 (define-constant MIN_PAYMENT u1000000)
 (define-constant MAX_PAYMENT u1000000000000)
 (define-constant MIN_SUBSCRIPTION_INTERVAL u144)
 (define-constant MAX_SUBSCRIPTION_INTERVAL u52560)
 (define-constant SUBSCRIPTION_GRACE_PERIOD u1008)
+
+;; Loyalty program constants
+(define-constant MIN_POINT_RATE u1)     ;; Minimum 1 point per 1000 microSTX
+(define-constant MAX_POINT_RATE u100)   ;; Max 100 points per 1000 microSTX
+(define-constant MIN_REDEMPTION_RATIO u10) ;; Min 10 points = 1 microSTX discount
+(define-constant MAX_REDEMPTION_RATIO u1000) ;; Max 1000 points = 1 microSTX discount
 
 (define-data-var contract-enabled bool true)
 (define-data-var total-vendors uint u0)
@@ -35,6 +44,8 @@
 (define-data-var total-subscriptions uint u0)
 (define-data-var total-subscription-revenue uint u0)
 (define-data-var total-reviews uint u0)
+(define-data-var next-loyalty-tx-id uint u1)
+(define-data-var loyalty-enabled bool true)
 
 (define-map vendors
   { vendor-id: principal }
@@ -163,6 +174,28 @@
   { customer: principal, vendor: principal }
   { can-review: bool, last-settled-payment: uint }
 )
+
+;; Loyalty program data maps
+(define-map vendor-loyalty-configs
+  { vendor: principal }
+  {
+    earning-rate: uint,          ;; points earned per 1000 microSTX spent
+    redemption-rate: uint        ;; points required to get 1 microSTX discount
+  })
+
+(define-map customer-loyalty-points
+  { customer: principal, vendor: principal }
+  { points: uint })
+
+(define-map loyalty-transactions
+  { tx-id: uint }
+  {
+    customer: principal,
+    vendor: principal,
+    points: int,                ;; positive earn, negative redemption
+    block: uint,
+    description: (string-ascii 100)
+  })
 
 (define-public (register-vendor (name (string-ascii 50)) (description (string-ascii 200)) (qr-code (string-ascii 100)))
   (let (
@@ -927,4 +960,164 @@
   }
 )
 
+;; Loyalty Program Functions
 
+(define-public (configure-loyalty-program (earning-rate uint) (redemption-rate uint))
+  (let (
+    (vendor tx-sender)
+  )
+    (asserts! (is-some (map-get? vendors { vendor-id: vendor })) ERR_VENDOR_NOT_FOUND)
+    (asserts! (and (>= earning-rate MIN_POINT_RATE) (<= earning-rate MAX_POINT_RATE)) ERR_INVALID_POINT_CONFIG)
+    (asserts! (and (>= redemption-rate MIN_REDEMPTION_RATIO) (<= redemption-rate MAX_REDEMPTION_RATIO)) ERR_INVALID_POINT_CONFIG)
+    
+    (map-set vendor-loyalty-configs
+      { vendor: vendor }
+      {
+        earning-rate: earning-rate,
+        redemption-rate: redemption-rate
+      })
+    
+    (ok true)
+  )
+)
+
+(define-public (award-loyalty-points (customer principal) (payment-id uint))
+  (let (
+    (vendor tx-sender)
+    (payment-info (unwrap! (map-get? payments { payment-id: payment-id }) ERR_PAYMENT_NOT_FOUND))
+    (loyalty-config (unwrap! (map-get? vendor-loyalty-configs { vendor: vendor }) ERR_POINTS_NOT_CONFIGURED))
+    (current-points (default-to { points: u0 } (map-get? customer-loyalty-points { customer: customer, vendor: vendor })))
+    (payment-amount (get amount payment-info))
+    (points-to-award (/ (* payment-amount (get earning-rate loyalty-config)) u1000))
+    (tx-id (var-get next-loyalty-tx-id))
+  )
+    (asserts! (var-get loyalty-enabled) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get vendor payment-info) vendor) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get customer payment-info) customer) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status payment-info) "settled") ERR_PAYMENT_NOT_SETTLED)
+    
+    ;; Award points
+    (map-set customer-loyalty-points
+      { customer: customer, vendor: vendor }
+      { points: (+ (get points current-points) points-to-award) })
+    
+    ;; Record transaction
+    (map-set loyalty-transactions
+      { tx-id: tx-id }
+      {
+        customer: customer,
+        vendor: vendor,
+        points: (to-int points-to-award),
+        block: stacks-block-height,
+        description: "Points earned from payment"
+      })
+    
+    (var-set next-loyalty-tx-id (+ tx-id u1))
+    
+    (ok points-to-award)
+  )
+)
+
+(define-public (redeem-loyalty-points (vendor principal) (points uint))
+  (let (
+    (customer tx-sender)
+    (loyalty-config (unwrap! (map-get? vendor-loyalty-configs { vendor: vendor }) ERR_POINTS_NOT_CONFIGURED))
+    (current-points (default-to { points: u0 } (map-get? customer-loyalty-points { customer: customer, vendor: vendor })))
+    (discount-amount (/ points (get redemption-rate loyalty-config)))
+    (tx-id (var-get next-loyalty-tx-id))
+  )
+    (asserts! (var-get loyalty-enabled) ERR_UNAUTHORIZED)
+    (asserts! (>= (get points current-points) points) ERR_INSUFFICIENT_POINTS)
+    (asserts! (> points u0) ERR_INVALID_POINT_CONFIG)
+    (asserts! (> discount-amount u0) ERR_INVALID_POINT_CONFIG)
+    
+    ;; Deduct points
+    (map-set customer-loyalty-points
+      { customer: customer, vendor: vendor }
+      { points: (- (get points current-points) points) })
+    
+    ;; Record transaction
+    (map-set loyalty-transactions
+      { tx-id: tx-id }
+      {
+        customer: customer,
+        vendor: vendor,
+        points: (- (to-int points)),
+        block: stacks-block-height,
+        description: "Points redeemed for discount"
+      })
+    
+    (var-set next-loyalty-tx-id (+ tx-id u1))
+    
+    (ok discount-amount)
+  )
+)
+
+(define-public (create-payment-with-points (vendor principal) (amount uint) (description (string-ascii 100)) (qr-data (string-ascii 150)) (points-to-redeem uint))
+  (let (
+    (customer tx-sender)
+    (loyalty-config (map-get? vendor-loyalty-configs { vendor: vendor }))
+    (discount-amount (if (is-some loyalty-config)
+                       (/ points-to-redeem (get redemption-rate (unwrap-panic loyalty-config)))
+                       u0))
+    (final-amount (if (> discount-amount u0)
+                    (if (>= amount discount-amount) (- amount discount-amount) u0)
+                    amount))
+  )
+    ;; Redeem points if applicable and then create payment
+    (if (and (is-some loyalty-config) (> points-to-redeem u0))
+      (begin
+        (try! (redeem-loyalty-points vendor points-to-redeem))
+        (create-payment vendor final-amount description qr-data)
+      )
+      (create-payment vendor final-amount description qr-data)
+    )
+  )
+)
+
+(define-public (toggle-loyalty-program (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set loyalty-enabled enabled)
+    (ok enabled)
+  )
+)
+
+;; Loyalty Program Read-Only Functions
+
+(define-read-only (get-vendor-loyalty-config (vendor principal))
+  (map-get? vendor-loyalty-configs { vendor: vendor })
+)
+
+(define-read-only (get-customer-loyalty-points (customer principal) (vendor principal))
+  (map-get? customer-loyalty-points { customer: customer, vendor: vendor })
+)
+
+(define-read-only (get-loyalty-transaction (tx-id uint))
+  (map-get? loyalty-transactions { tx-id: tx-id })
+)
+
+(define-read-only (calculate-points-for-amount (vendor principal) (amount uint))
+  (match (map-get? vendor-loyalty-configs { vendor: vendor })
+    config (some (/ (* amount (get earning-rate config)) u1000))
+    none
+  )
+)
+
+(define-read-only (calculate-discount-for-points (vendor principal) (points uint))
+  (match (map-get? vendor-loyalty-configs { vendor: vendor })
+    config (some (/ points (get redemption-rate config)))
+    none
+  )
+)
+
+(define-read-only (is-loyalty-enabled)
+  (var-get loyalty-enabled)
+)
+
+(define-read-only (get-loyalty-stats)
+  {
+    next-tx-id: (var-get next-loyalty-tx-id),
+    loyalty-enabled: (var-get loyalty-enabled)
+  }
+)
